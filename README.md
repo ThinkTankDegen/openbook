@@ -75,3 +75,4 @@ Any questions? Ping me:
 - Here
 - On X - https://x.com/ThinkTank_X
 - On Discord - think.tank.
+- Degen wallet: BqpVsNuznx4tJPNC4RNd2FmoFzMu4wPbQMMwEHZiyV6B
