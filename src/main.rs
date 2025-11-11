@@ -1,447 +1,427 @@
 use anyhow::Result;
+use clap::{Args, Parser, Subcommand};
+use solana_cli_output::display::println_transaction;
+use tokio::time::{sleep, Duration};
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
-/// The entry point for the OpenBook CLI application.
-///
-/// # Returns
-///
-/// Returns `Ok(())` on success or an error if an error occurs.|
+// Re-exports from the openbook crate
+use openbook::commitment_config::CommitmentConfig;
+use openbook::matching::Side;
+use openbook::v1::ob_client::OBClient;
+use openbook::v1::orders::OrderReturnType;
+
+use openbook::signature::Signature;
+
+const CRANK_DELAY_MS: u64 = 50_000;
+const MAX_CANCEL_ORDERS: usize = 5;
+const MAX_CANCEL_ORDERS_PER_TX: usize = 5;
+
+/// Simple v1-only CLI for OpenBook.
+#[derive(Parser, Debug)]
+#[command(
+    author = "You",
+    version,
+    about = "OpenBook v1 CLI (no v2, no TUI)",
+    long_about = None
+)]
+struct Cli {
+    /// Increase verbosity (-v, -vv, -vvv)
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Market id to trade on (OpenBook v1 market address)
+    #[arg(
+        short,
+        long,
+        default_value_t = String::from(
+            "8BnEgHoWFysVcuFFX7QztDmzuH8r5ZFvyP3sYwn1XTh6"
+        )
+    )]
+    market_id: String,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Fetch market info & current open orders
+    Info,
+
+    /// Place a limit order (bid / ask)
+    Place(Place),
+
+    /// Cancel all open orders for your OOS account
+    Cancel(Cancel),
+
+    /// Settle balances
+    Settle(Settle),
+
+    /// Match orders (crank)
+    Match(MatchOrders),
+
+    /// Cancel, settle, place both bid & ask
+    CancelSettlePlace(CancelSettlePlace),
+
+    /// Cancel, settle, place only bid
+    CancelSettlePlaceBid(CancelSettlePlaceBid),
+
+    /// Cancel, settle, place only ask
+    CancelSettlePlaceAsk(CancelSettlePlaceAsk),
+
+    /// Consume events
+    Consume(Consume),
+
+    /// Consume events (permissioned)
+    ConsumePermissioned(ConsumePermissioned),
+
+    /// Load orders for owner
+    LoadOrders,
+
+    /// Find open orders accounts for owner
+    FindOpenOrders,
+}
+
+// Argument structs mirror `src/cli.rs` from the original repo.
+
+#[derive(Args, Debug, Clone)]
+struct Place {
+    /// Target amount in quote currency (e.g. USDC)
+    #[arg(short, long)]
+    target_amount_quote: f64,
+
+    /// Side: "bid" or "ask"
+    #[arg(short, long)]
+    side: String,
+
+    /// Best offset in USDC
+    #[arg(short, long)]
+    best_offset_usdc: f64,
+
+    /// Execute on-chain (if false, only build instructions)
+    #[arg(short, long)]
+    execute: bool,
+
+    /// Target price
+    #[arg(short, long)]
+    price_target: f64,
+}
+
+#[derive(Args, Debug, Clone)]
+struct Cancel {
+    /// Execute on-chain (if false, only build instructions)
+    #[arg(short, long)]
+    execute: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct Settle {
+    /// Execute on-chain (if false, only build instructions)
+    #[arg(short, long)]
+    execute: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct MatchOrders {
+    /// Maximum number of orders to match
+    #[arg(short, long)]
+    limit: u16,
+}
+
+#[derive(Args, Debug, Clone)]
+struct CancelSettlePlace {
+    /// Target size in USDC for the ask order
+    #[arg(short, long)]
+    usdc_ask_target: f64,
+
+    /// Target size in USDC for the bid order
+    #[arg(short, long)]
+    target_usdc_bid: f64,
+
+    /// Bid price in JLP/USDC
+    #[arg(short, long)]
+    price_jlp_usdc_bid: f64,
+
+    /// Ask price in JLP/USDC
+    #[arg(short, long)]
+    ask_price_jlp_usdc: f64,
+}
+
+#[derive(Args, Debug, Clone)]
+struct CancelSettlePlaceBid {
+    /// Target size in USDC for the bid order
+    #[arg(short, long)]
+    target_size_usdc_bid: f64,
+
+    /// Bid price in JLP/USDC
+    #[arg(short, long)]
+    bid_price_jlp_usdc: f64,
+}
+
+#[derive(Args, Debug, Clone)]
+struct CancelSettlePlaceAsk {
+    /// Target size in USDC for the ask order
+    #[arg(short, long)]
+    target_size_usdc_ask: f64,
+
+    /// Ask price in JLP/USDC
+    #[arg(short, long)]
+    ask_price_jlp_usdc: f64,
+}
+
+#[derive(Args, Debug, Clone)]
+struct Consume {
+    /// Limit for consume events instruction
+    #[arg(short, long)]
+    limit: u16,
+}
+
+#[derive(Args, Debug, Clone)]
+struct ConsumePermissioned {
+    /// Limit for consume events permissioned instruction
+    #[arg(short, long)]
+    limit: u16,
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(feature = "cli")]
-    {
-        use clap::Parser;
-        use openbook::cli::{Cli, Commands, V1ActionsCommands, V2ActionsCommands};
-        use openbook::commitment_config::CommitmentConfig;
-        use openbook::matching::Side;
-        use tokio::time::{sleep, Duration};
+async fn main() -> Result<()> {
+    // Basic logging
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(val) => EnvFilter::new(val),
+        Err(_) => EnvFilter::new("info"),
+    };
 
-        use openbook::tui::run_tui;
-        #[cfg(feature = "v2")]
-        use openbook::tui::SdkVersion;
-        #[cfg(feature = "v1")]
-        use openbook::v1::{ob_client::OBClient as OBV1Client, orders::OrderReturnType};
-        #[cfg(feature = "v2")]
-        use openbook::v2::ob_client::OBClient as OBV2Client;
-        use openbook::v2_state::Side as V2Side;
-        use solana_cli_output::display::println_transaction;
-        use tracing::{error, info};
-        use tracing_subscriber::{filter, fmt};
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_line_number(false)
+        .compact()
+        .init();
 
-        // Start configuring a `fmt` subscriber
-        let filter = filter::LevelFilter::INFO;
-        let subscriber = fmt()
-            .compact()
-            .with_max_level(filter)
-            .with_file(false)
-            .with_line_number(false)
-            .with_thread_ids(false)
-            .with_target(false)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)?;
+    let cli = Cli::parse();
 
-        let args = Cli::parse();
+    // Instantiate OB v1 client
+    let market_id = cli.market_id.parse()?;
+    let mut ob_client = OBClient::new(
+        CommitmentConfig::confirmed(),
+        market_id,
+        true,          // use_cache
+        123456789_u128 // cache_ts (just a nonce)
+    )
+    .await?;
 
-        const CRANK_DELAY_MS: u64 = 50_000;
+    match cli.command {
+        Commands::Info => {
+            info!("[*] OB_V1_Client:\n{:#?}", ob_client);
+        }
 
-        match args.command {
-            Some(Commands::V1(cmd)) => {
-                let mut ob_client_v1 = OBV1Client::new(
-                    CommitmentConfig::confirmed(),
-                    cmd.market_id.parse().unwrap(),
-                    true,
-                    123456789,
+        Commands::Place(arg) => {
+            let side = match arg.side.to_ascii_lowercase().as_str() {
+                "bid" => Side::Bid,
+                "ask" => Side::Ask,
+                _ => Side::Bid,
+            };
+
+            if let Some(ord_ret_type) = ob_client
+                .place_limit_order(
+                    arg.target_amount_quote,
+                    side,
+                    arg.best_offset_usdc,
+                    arg.execute,
+                    arg.price_target,
+                )
+                .await?
+            {
+                handle_order_return(&mut ob_client, ord_ret_type).await?;
+            }
+        }
+
+        Commands::Cancel(arg) => {
+            if arg.execute {
+                if let Some(signature) = execute_limited_cancel(
+                    &mut ob_client,
+                    MAX_CANCEL_ORDERS,
+                    MAX_CANCEL_ORDERS_PER_TX,
+                )
+                .await?
+                {
+                    info!("\n[*] Transaction successful, signature: {:?}", signature);
+                    show_tx(&mut ob_client, &signature).await?;
+                }
+            } else if let Some(ord_ret_type) = ob_client.cancel_orders(false).await? {
+                handle_order_return(&mut ob_client, ord_ret_type).await?;
+            }
+        }
+
+        Commands::Settle(arg) => {
+            if let Some(ord_ret_type) = ob_client.settle_balance(arg.execute).await? {
+                handle_order_return(&mut ob_client, ord_ret_type).await?;
+            }
+        }
+
+        Commands::Match(arg) => {
+            let (_confirmed, signature) =
+                ob_client.match_orders_transaction(arg.limit).await?;
+            info!("\n[*] Transaction successful, signature: {:?}", signature);
+            show_tx(&mut ob_client, &signature).await?;
+        }
+
+        Commands::CancelSettlePlace(arg) => {
+            let (_confirmed, signature) = ob_client
+                .cancel_settle_place(
+                    arg.usdc_ask_target,
+                    arg.target_usdc_bid,
+                    arg.price_jlp_usdc_bid,
+                    arg.ask_price_jlp_usdc,
                 )
                 .await?;
-                match cmd.command {
-                    Some(V1ActionsCommands::Info(_)) => {
-                        info!("\n[*] {:?}", ob_client_v1);
-                    }
-                    Some(V1ActionsCommands::Place(arg)) => {
-                        let side = match arg.side.to_ascii_lowercase().as_str() {
-                            "bid" => Side::Bid,
-                            "ask" => Side::Ask,
-                            _ => Side::Bid,
-                        };
+            info!("\n[*] Transaction successful, signature: {:?}", signature);
+            show_tx(&mut ob_client, &signature).await?;
+        }
 
-                        if let Some(ord_ret_type) = ob_client_v1
-                            .place_limit_order(
-                                arg.target_amount_quote,
-                                side,
-                                arg.best_offset_usdc,
-                                arg.execute,
-                                arg.price_target,
-                            )
-                            .await?
-                        {
-                            match ord_ret_type {
-                                OrderReturnType::Instructions(insts) => {
-                                    info!("\n[*] Got Instructions: {:?}", insts);
-                                }
-                                OrderReturnType::Signature(signature) => {
-                                    info!(
-                                        "\n[*] Transaction successful, signature: {:?}",
-                                        signature
-                                    );
-                                    // wait for the tx to be cranked
-                                    sleep(Duration::from_millis(CRANK_DELAY_MS)).await;
-                                    match ob_client_v1
-                                        .rpc_client
-                                        .fetch_transaction(&signature)
-                                        .await
-                                    {
-                                        Ok(confirmed_transaction) => {
-                                            println_transaction(
-                                                &confirmed_transaction
-                                                    .transaction
-                                                    .transaction
-                                                    .decode()
-                                                    .expect("Successful decode"),
-                                                confirmed_transaction.transaction.meta.as_ref(),
-                                                "  ",
-                                                None,
-                                                None,
-                                            );
-                                        }
-                                        Err(err) => error!(
-                                            "[*] Unable to get confirmed transaction details: {}",
-                                            err
-                                        ),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Some(V1ActionsCommands::Cancel(arg)) => {
-                        if let Some(ord_ret_type) = ob_client_v1.cancel_orders(arg.execute).await? {
-                            match ord_ret_type {
-                                OrderReturnType::Instructions(insts) => {
-                                    info!("\n[*] Got Instructions: {:?}", insts);
-                                }
-                                OrderReturnType::Signature(signature) => {
-                                    info!(
-                                        "\n[*] Transaction successful, signature: {:?}",
-                                        signature
-                                    );
-                                    // wait for the tx to be cranked
-                                    sleep(Duration::from_millis(CRANK_DELAY_MS)).await;
-                                    match ob_client_v1
-                                        .rpc_client
-                                        .fetch_transaction(&signature)
-                                        .await
-                                    {
-                                        Ok(confirmed_transaction) => {
-                                            println_transaction(
-                                                &confirmed_transaction
-                                                    .transaction
-                                                    .transaction
-                                                    .decode()
-                                                    .expect("Successful decode"),
-                                                confirmed_transaction.transaction.meta.as_ref(),
-                                                "  ",
-                                                None,
-                                                None,
-                                            );
-                                        }
-                                        Err(err) => error!(
-                                            "[*] Unable to get confirmed transaction details: {}",
-                                            err
-                                        ),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Some(V1ActionsCommands::Settle(arg)) => {
-                        if let Some(ord_ret_type) = ob_client_v1.settle_balance(arg.execute).await?
-                        {
-                            match ord_ret_type {
-                                OrderReturnType::Instructions(insts) => {
-                                    info!("\n[*] Got Instructions: {:?}", insts);
-                                }
-                                OrderReturnType::Signature(signature) => {
-                                    info!(
-                                        "\n[*] Transaction successful, signature: {:?}",
-                                        signature
-                                    );
-                                    // wait for the tx to be cranked
-                                    sleep(Duration::from_millis(CRANK_DELAY_MS)).await;
-                                    match ob_client_v1
-                                        .rpc_client
-                                        .fetch_transaction(&signature)
-                                        .await
-                                    {
-                                        Ok(confirmed_transaction) => {
-                                            println_transaction(
-                                                &confirmed_transaction
-                                                    .transaction
-                                                    .transaction
-                                                    .decode()
-                                                    .expect("Successful decode"),
-                                                confirmed_transaction.transaction.meta.as_ref(),
-                                                "  ",
-                                                None,
-                                                None,
-                                            );
-                                        }
-                                        Err(err) => error!(
-                                            "[*] Unable to get confirmed transaction details: {}",
-                                            err
-                                        ),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Some(V1ActionsCommands::Match(arg)) => {
-                        let (_confirmed, signature) =
-                            ob_client_v1.match_orders_transaction(arg.limit).await?;
-                        info!("\n[*] Transaction successful, signature: {:?}", signature);
-                        // wait for the tx to be cranked
-                        sleep(Duration::from_millis(CRANK_DELAY_MS)).await;
-                        match ob_client_v1.rpc_client.fetch_transaction(&signature).await {
-                            Ok(confirmed_transaction) => {
-                                info!("\n{:?}", confirmed_transaction);
-                                println_transaction(
-                                    &confirmed_transaction
-                                        .transaction
-                                        .transaction
-                                        .decode()
-                                        .expect("Successful decode"),
-                                    confirmed_transaction.transaction.meta.as_ref(),
-                                    "  ",
-                                    None,
-                                    None,
-                                );
-                            }
-                            Err(err) => {
-                                error!("[*] Unable to get confirmed transaction details: {}", err)
-                            }
-                        }
-                    }
-                    Some(V1ActionsCommands::CancelSettlePlace(arg)) => {
-                        let (_confirmed, signature) = ob_client_v1
-                            .cancel_settle_place(
-                                arg.usdc_ask_target,
-                                arg.target_usdc_bid,
-                                arg.price_jlp_usdc_bid,
-                                arg.ask_price_jlp_usdc,
-                            )
-                            .await?;
-                        info!("\n[*] Transaction successful, signature: {:?}", signature);
-                        // wait for the tx to be cranked
-                        sleep(Duration::from_millis(CRANK_DELAY_MS)).await;
-                        match ob_client_v1.rpc_client.fetch_transaction(&signature).await {
-                            Ok(confirmed_transaction) => {
-                                info!("\n{:?}", confirmed_transaction);
-                                println_transaction(
-                                    &confirmed_transaction
-                                        .transaction
-                                        .transaction
-                                        .decode()
-                                        .expect("Successful decode"),
-                                    confirmed_transaction.transaction.meta.as_ref(),
-                                    "  ",
-                                    None,
-                                    None,
-                                );
-                            }
-                            Err(err) => {
-                                error!("[*] Unable to get confirmed transaction details: {}", err)
-                            }
-                        }
-                    }
-                    Some(V1ActionsCommands::CancelSettlePlaceBid(arg)) => {
-                        let (_confirmed, signature) = ob_client_v1
-                            .cancel_settle_place_bid(
-                                arg.target_size_usdc_bid,
-                                arg.bid_price_jlp_usdc,
-                            )
-                            .await?;
-                        info!("\n[*] Transaction successful, signature: {:?}", signature);
-                        // wait for the tx to be cranked
-                        sleep(Duration::from_millis(CRANK_DELAY_MS)).await;
-                        match ob_client_v1.rpc_client.fetch_transaction(&signature).await {
-                            Ok(confirmed_transaction) => {
-                                info!("\n{:?}", confirmed_transaction);
-                                println_transaction(
-                                    &confirmed_transaction
-                                        .transaction
-                                        .transaction
-                                        .decode()
-                                        .expect("Successful decode"),
-                                    confirmed_transaction.transaction.meta.as_ref(),
-                                    "  ",
-                                    None,
-                                    None,
-                                );
-                            }
-                            Err(err) => {
-                                error!("[*] Unable to get confirmed transaction details: {}", err)
-                            }
-                        }
-                    }
-                    Some(V1ActionsCommands::CancelSettlePlaceAsk(arg)) => {
-                        let (_confirmed, signature) = ob_client_v1
-                            .cancel_settle_place_ask(
-                                arg.target_size_usdc_ask,
-                                arg.ask_price_jlp_usdc,
-                            )
-                            .await?;
-                        info!("\n[*] Transaction successful, signature: {:?}", signature);
-                        // wait for the tx to be cranked
-                        sleep(Duration::from_millis(CRANK_DELAY_MS)).await;
-                        match ob_client_v1.rpc_client.fetch_transaction(&signature).await {
-                            Ok(confirmed_transaction) => {
-                                info!("\n{:?}", confirmed_transaction);
-                                println_transaction(
-                                    &confirmed_transaction
-                                        .transaction
-                                        .transaction
-                                        .decode()
-                                        .expect("Successful decode"),
-                                    confirmed_transaction.transaction.meta.as_ref(),
-                                    "  ",
-                                    None,
-                                    None,
-                                );
-                            }
-                            Err(err) => {
-                                error!("[*] Unable to get confirmed transaction details: {}", err)
-                            }
-                        }
-                    }
-                    Some(V1ActionsCommands::Consume(arg)) => {
-                        let (_confirmed, signature) = ob_client_v1
-                            .consume_events_instruction(Vec::new(), arg.limit)
-                            .await?;
-                        info!("\n[*] Transaction successful, signature: {:?}", signature);
-                        // wait for the tx to be cranked
-                        sleep(Duration::from_millis(CRANK_DELAY_MS)).await;
-                        match ob_client_v1.rpc_client.fetch_transaction(&signature).await {
-                            Ok(confirmed_transaction) => {
-                                info!("\n{:?}", confirmed_transaction);
-                                println_transaction(
-                                    &confirmed_transaction
-                                        .transaction
-                                        .transaction
-                                        .decode()
-                                        .expect("Successful decode"),
-                                    confirmed_transaction.transaction.meta.as_ref(),
-                                    "  ",
-                                    None,
-                                    None,
-                                );
-                            }
-                            Err(err) => {
-                                error!("[*] Unable to get confirmed transaction details: {}", err)
-                            }
-                        }
-                    }
-                    Some(V1ActionsCommands::ConsumePermissioned(arg)) => {
-                        let (_confirmed, signature) = ob_client_v1
-                            .consume_events_permissioned_instruction(Vec::new(), arg.limit)
-                            .await?;
-                        info!("\n[*] Transaction successful, signature: {:?}", signature);
-                        // wait for the tx to be cranked
-                        sleep(Duration::from_millis(CRANK_DELAY_MS)).await;
-                        match ob_client_v1.rpc_client.fetch_transaction(&signature).await {
-                            Ok(confirmed_transaction) => {
-                                info!("\n{:?}", confirmed_transaction);
-                                println_transaction(
-                                    &confirmed_transaction
-                                        .transaction
-                                        .transaction
-                                        .decode()
-                                        .expect("Successful decode"),
-                                    confirmed_transaction.transaction.meta.as_ref(),
-                                    "  ",
-                                    None,
-                                    None,
-                                );
-                            }
-                            Err(err) => {
-                                error!("[*] Unable to get confirmed transaction details: {}", err)
-                            }
-                        }
-                    }
-                    Some(V1ActionsCommands::Load(_arg)) => {
-                        let l = ob_client_v1.load_orders_for_owner().await?;
-                        info!("\n[*] Found Program Accounts: {:?}", l);
-                    }
-                    Some(V1ActionsCommands::Find(_arg)) => {
-                        let result = ob_client_v1
-                            .find_open_orders_accounts_for_owner(
-                                ob_client_v1.open_orders.oo_key,
-                                1000,
-                            )
-                            .await?;
-                        info!("\n[*] Found Open Orders Accounts: {:?}", result);
-                    }
-                    None => {
-                        let _ = run_tui(SdkVersion::V1).await;
-                    }
-                }
-            }
-            Some(Commands::V2(cmd)) => {
-                let mut ob_client_v2 = OBV2Client::new(
-                    CommitmentConfig::confirmed(),
-                    cmd.market_id.parse().unwrap(),
-                    false,
-                    true,
+        Commands::CancelSettlePlaceBid(arg) => {
+            let (_confirmed, signature) = ob_client
+                .cancel_settle_place_bid(
+                    arg.target_size_usdc_bid,
+                    arg.bid_price_jlp_usdc,
                 )
                 .await?;
+            info!("\n[*] Transaction successful, signature: {:?}", signature);
+            show_tx(&mut ob_client, &signature).await?;
+        }
 
-                match cmd.command {
-                    Some(V2ActionsCommands::Info(_)) => {
-                        info!("\n[*] {:?}", ob_client_v2);
-                    }
-                    Some(V2ActionsCommands::Place(arg)) => {
-                        let side = match arg.side.as_str() {
-                            "bid" => V2Side::Bid,
-                            "ask" => V2Side::Ask,
-                            _ => V2Side::Bid,
-                        };
+        Commands::CancelSettlePlaceAsk(arg) => {
+            let (_confirmed, signature) = ob_client
+                .cancel_settle_place_ask(
+                    arg.target_size_usdc_ask,
+                    arg.ask_price_jlp_usdc,
+                )
+                .await?;
+            info!("\n[*] Transaction successful, signature: {:?}", signature);
+            show_tx(&mut ob_client, &signature).await?;
+        }
 
-                        let (_confirmed, signature, _order_id, _slot) = ob_client_v2
-                            .place_limit_order(
-                                arg.price_target,
-                                arg.target_amount_quote as u64,
-                                side,
-                            )
-                            .await?;
-                        info!("\n[*] Transaction successful, signature: {:?}", signature);
-                        // wait for the tx to be cranked
-                        sleep(Duration::from_millis(CRANK_DELAY_MS)).await;
-                        match ob_client_v2.rpc_client.fetch_transaction(&signature).await {
-                            Ok(confirmed_transaction) => {
-                                info!("\n{:?}", confirmed_transaction);
-                                println_transaction(
-                                    &confirmed_transaction
-                                        .transaction
-                                        .transaction
-                                        .decode()
-                                        .expect("Successful decode"),
-                                    confirmed_transaction.transaction.meta.as_ref(),
-                                    "  ",
-                                    None,
-                                    None,
-                                );
-                            }
-                            Err(err) => {
-                                error!("[*] Unable to get confirmed transaction details: {}", err)
-                            }
-                        }
-                    }
-                    None => {
-                        let _ = run_tui(SdkVersion::V2).await;
-                    }
+        Commands::Consume(arg) => {
+            let (_confirmed, signature) = ob_client
+                .consume_events_instruction(Vec::new(), arg.limit)
+                .await?;
+            info!("\n[*] Transaction successful, signature: {:?}", signature);
+            show_tx(&mut ob_client, &signature).await?;
+        }
+
+        Commands::ConsumePermissioned(arg) => {
+            let (_confirmed, signature) = ob_client
+                .consume_events_permissioned_instruction(Vec::new(), arg.limit)
+                .await?;
+            info!("\n[*] Transaction successful, signature: {:?}", signature);
+            show_tx(&mut ob_client, &signature).await?;
+        }
+
+        Commands::LoadOrders => {
+            match ob_client.load_orders_for_owner().await {
+                Ok(l) => {
+                    info!("\n[*] Found Program Accounts: {:#?}", l);
+                }
+                Err(e) => {
+                    eprintln!("[*] Error loading orders for owner: {e}");
                 }
             }
-            None => {
-                // default is OpenBook V2
-                let _ = run_tui(SdkVersion::V2).await;
+        }
+
+        Commands::FindOpenOrders => {
+            match ob_client
+                .find_open_orders_accounts_for_owner(ob_client.open_orders.oo_key, 1000)
+                .await
+            {
+                Ok(result) => {
+                    info!("\n[*] Found Open Orders Accounts: {:#?}", result);
+                }
+                Err(e) => {
+                    eprintln!("[*] Error finding open orders accounts: {e}");
+                }
             }
-        };
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_order_return(
+    ob_client: &mut OBClient,
+    ord_ret_type: OrderReturnType,
+) -> Result<()> {
+    match ord_ret_type {
+        OrderReturnType::Instructions(insts) => {
+            info!("\n[*] Got Instructions: {:?}", insts);
+        }
+        OrderReturnType::Signature(signature) => {
+            info!("\n[*] Transaction successful, signature: {:?}", signature);
+            show_tx(ob_client, &signature).await?;
+        }
     }
     Ok(())
 }
+
+async fn show_tx(ob_client: &mut OBClient, signature: &Signature) -> Result<()> {
+    // wait for crank
+    sleep(Duration::from_millis(CRANK_DELAY_MS)).await;
+
+    match ob_client.rpc_client.fetch_transaction(signature).await {
+        Ok(confirmed_tx) => {
+            println_transaction(
+                &confirmed_tx
+                    .transaction
+                    .transaction
+                    .decode()
+                    .expect("Successful decode"),
+                confirmed_tx.transaction.meta.as_ref(),
+                " ",
+                None,
+                None,
+            );
+        }
+        Err(err) => {
+            error!(
+                "[*] Unable to get confirmed transaction details: {}",
+                err
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn execute_limited_cancel(
+    ob_client: &mut OBClient,
+    max_instructions: usize,
+    max_instructions_per_tx: usize,
+) -> Result<Option<Signature>> {
+    let ord_ret_type = match ob_client.cancel_orders(false).await? {
+        Some(ret) => ret,
+        None => return Ok(None),
+    };
+
+    let OrderReturnType::Instructions(mut insts) = ord_ret_type else {
+        return Ok(None);
+    };
+
+    if insts.is_empty() {
+        return Ok(None);
+    }
+
+    insts.truncate(max_instructions);
+
+    let mut last_sig = None;
+    for chunk in insts.chunks(max_instructions_per_tx.max(1)) {
+        let (_, signature) = ob_client
+            .rpc_client
+            .send_and_confirm((*ob_client.owner).insecure_clone(), chunk.to_vec())
+            .await?;
+        last_sig = Some(signature);
+    }
+
+    Ok(last_sig)
+}
+

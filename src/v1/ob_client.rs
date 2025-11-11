@@ -41,6 +41,9 @@ use tracing::debug;
 pub static SPL_TOKEN_ID: &'static str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub static SRM_PROGRAM_ID: &'static str = "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX";
 
+// Limit how many cancel instructions we build so we do not exceed Solana's 1232-byte raw transaction size cap.
+const MAX_CANCEL_ORDERS: usize = 5;
+
 /// OpenBook v1 Client to interact with the OpenBook market and perform actions.
 #[derive(Clone)]
 pub struct OBClient {
@@ -644,7 +647,7 @@ impl OBClient {
         Ok(Some(OrderReturnType::Signature(signature)))
     }
 
-    /// Cancels all limit orders in the market.
+    /// Cancels up to `MAX_CANCEL_ORDERS` limit orders in the market.
     ///
     /// # Arguments
     ///
@@ -693,9 +696,72 @@ impl OBClient {
     /// }
     /// ```
     pub async fn cancel_orders(&self, execute: bool) -> Result<Option<OrderReturnType>, Error> {
+        if execute {
+            let mut processed = 0;
+            let mut last_signature = None;
+
+            for oid in &self.open_orders.open_bids {
+                if processed >= MAX_CANCEL_ORDERS {
+                    break;
+                }
+
+                let ix = openbook_dex::instruction::cancel_order(
+                    &self.market_info.program_id,
+                    &self.market_info.market_address,
+                    &self.market_info.bids_address,
+                    &self.market_info.asks_address,
+                    &self.open_orders.oo_key,
+                    &self.owner.pubkey(),
+                    &self.market_info.event_queue,
+                    Side::Bid,
+                    *oid,
+                )?;
+
+                let (_, signature) = self
+                    .rpc_client
+                    .send_and_confirm((*self.owner).insecure_clone(), vec![ix])
+                    .await?;
+
+                last_signature = Some(signature);
+                processed += 1;
+            }
+
+            for oid in &self.open_orders.open_asks {
+                if processed >= MAX_CANCEL_ORDERS {
+                    break;
+                }
+
+                let ix = openbook_dex::instruction::cancel_order(
+                    &self.market_info.program_id,
+                    &self.market_info.market_address,
+                    &self.market_info.bids_address,
+                    &self.market_info.asks_address,
+                    &self.open_orders.oo_key,
+                    &self.owner.pubkey(),
+                    &self.market_info.event_queue,
+                    Side::Ask,
+                    *oid,
+                )?;
+
+                let (_, signature) = self
+                    .rpc_client
+                    .send_and_confirm((*self.owner).insecure_clone(), vec![ix])
+                    .await?;
+
+                last_signature = Some(signature);
+                processed += 1;
+            }
+
+            return Ok(last_signature.map(OrderReturnType::Signature));
+        }
+
         let mut ixs = Vec::new();
 
         for oid in &self.open_orders.open_bids {
+            if ixs.len() >= MAX_CANCEL_ORDERS {
+                break;
+            }
+
             let ix = openbook_dex::instruction::cancel_order(
                 &self.market_info.program_id,
                 &self.market_info.market_address,
@@ -711,6 +777,10 @@ impl OBClient {
         }
 
         for oid in &self.open_orders.open_asks {
+            if ixs.len() >= MAX_CANCEL_ORDERS {
+                break;
+            }
+
             let ix = openbook_dex::instruction::cancel_order(
                 &self.market_info.program_id,
                 &self.market_info.market_address,
@@ -729,16 +799,7 @@ impl OBClient {
             return Ok(None);
         }
 
-        if !execute {
-            return Ok(Some(OrderReturnType::Instructions(ixs)));
-        }
-
-        let (_, signature) = self
-            .rpc_client
-            .send_and_confirm((*self.owner).insecure_clone(), ixs)
-            .await?;
-
-        Ok(Some(OrderReturnType::Signature(signature)))
+        Ok(Some(OrderReturnType::Instructions(ixs)))
     }
 
     /// Settles the balance for a user in the market.

@@ -1,79 +1,35 @@
 [package]
-name = "openbook"
+name = "openbook-v1-cli"
 version = "0.1.0"
 edition = "2021"
-description = "📖1️⃣2️⃣ A CLI, TUI and SDK to interact with OpenBook V1 and V2 markets on the Solana blockchain."
-license = "MIT"
-keywords = ["blockchain", "cli", "solana", "dex"]
-categories = ["command-line-utilities", "web-programming", "science"]
-repository = "https://github.com/gigadao/openbook"
-documentation = "https://docs.rs/openbook"
-authors = [
-	"GigaDAO Core Maintainers",
-	"Mahmoud Harmouch <oss@wiseai.dev>",
-]
-exclude = ["tests", "examples"]
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-# v1 deps
-openbook_dex = { version = "0.5.6" , features = ["test", "client"], optional = true } 
+anyhow = "1.0"
 
-# common
-anyhow = "1.0.80"
+tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "time"] }
+clap = { version = "4.5", features = ["derive"] }
+
+solana-cli-output = "=1.17.34"
+
+# Use GigaDAO/openbook as a *library*, only with v1 feature.
+openbook = { git = "https://github.com/GigaDAO/openbook.git", default-features = false, features = ["v1"] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 solana-sdk = "=1.17.34"
-rand = "0.8.5"
 solana-client = "=1.17.34"
 solana-rpc-client-api = "=1.17.34"
-borsh = "0.10.3"
-serde_json = "1.0.114"
-tokio = { version = "1.36.0", features = ["time"] }
-spl-associated-token-account = "=2.3.0"
-clap = { version = "4.5.1", features = ["derive"], optional = true }
-solana-cli-output = { version = "=1.17.34" , optional = true  }
 solana-transaction-status = "=1.17.34"
-backon = "0.4.3"
-ratatui = { version = "0.26.2", features = ["crossterm"], optional = true }
-tui-input = { version = "0.8.0", optional = true }
-serde = { version = "1.0.200", features = ["derive"] }
-crossterm = { version = "0.27.0", optional = true }
-unicode-width = { version = "0.1.12", optional = true }
-strum = { version = "0.26.2", optional = true }
-tracing = "0.1.40"
-tracing-subscriber = { version = "0.3.18", features = ["std"], optional = true }
-
-# v2 deps
-openbookdex-v2 = {version = "0.1.0", features = ["client"], optional = true }
-reqwest = { version = "0.11.27", optional = true }
-itertools = { version = "0.13.0", optional = true }
-anchor-client = { version = "0.29.0", optional = true }
-anchor-lang = { version = "0.29.0", optional = true }
-anchor-spl = { version = "0.29.0", optional = true }
-fixed = { version = "1.11.0", optional = true }
-pyth-sdk-solana = { version = "0.10.1", optional = true }
-solana-account-decoder = { version = "=1.17.34", optional = true }
-async-once-cell = {version = "0.4.2", features = ["unpin"], optional = true}
-async-trait = {version = "0.1.80", optional = true}
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+backon = "0.4"
 
 [features]
 default = []
-v1 = ["openbook_dex", ]
-v2 = ["openbookdex-v2", "reqwest", "anchor-client", "anchor-lang", "anchor-spl", "fixed", "pyth-sdk-solana", "solana-account-decoder", "async-trait", "async-once-cell", "itertools"]
-cli = ["clap", "solana-cli-output", "ratatui", "tui-input", "crossterm", "unicode-width", "strum", "tracing-subscriber"]
+cli = []
+v1 = []
+v2 = []
 
-[dev-dependencies]
-bump2version = "0.1.3"
+[patch.crates-io]
+solana_rbpf = { git = "https://github.com/solana-labs/rbpf", tag = "v0.8.0" }
 
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
-
-[profile.release]
-codegen-units = 1
-opt-level = "z"
-lto = "thin"
-strip = "symbols"
-
-[badges]
-maintenance = { status = "actively-developed" }
