@@ -49,6 +49,24 @@ Run this command to simulate the cancel of up to `MAX_CANCEL_ORDERS` at once. Th
   cancel
 ```
 
+## Inspect the event queue
+Run this command to see how many pending events are still waiting to be cranked/consumed.
+```
+./target/release/openbook-v1-cli \
+  --market-id TheMARKETid \
+  event-queue
+```
+If `pending_events` is greater than zero the market still has work for a crank to process.
+
+## Consume events / crank
+Run this command to process pending events. If you do not pass `--open-orders`, the CLI will scan the event queue and include the accounts currently referenced; otherwise you can provide a comma-separated list.
+```
+./target/release/openbook-v1-cli \
+  --market-id TheMARKETid \
+  consume --limit 5 --open-orders ooPubkey1,ooPubkey2
+```
+For permissioned markets, swap `consume` with `consume-permissioned`.
+
 ## Cancel open orders (Actual execution mode)
 Run this command to cancel up to `MAX_CANCEL_ORDERS` at once. This is already set to 5 in the code in order to avoid exceeding the block limit. Feel free to change it. If you have more open orders you can re-run the command.
 ```

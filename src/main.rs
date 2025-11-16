@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
 use solana_cli_output::display::println_transaction;
 use tokio::time::{sleep, Duration};
@@ -11,7 +11,10 @@ use openbook::matching::Side;
 use openbook::v1::ob_client::{OBClient, PROGRAM_ID_ENV, SRM_PROGRAM_ID};
 use openbook::v1::orders::OrderReturnType;
 
+use openbook::pubkey::Pubkey;
 use openbook::signature::Signature;
+
+use std::str::FromStr;
 
 const CRANK_DELAY_MS: u64 = 50_000;
 const MAX_CANCEL_ORDERS: usize = 5;
@@ -56,6 +59,9 @@ struct Cli {
 enum Commands {
     /// Fetch market info & current open orders
     Info,
+
+    /// Display event queue status (pending events, head, seq)
+    EventQueue,
 
     /// Place a limit order (bid / ask)
     Place(Place),
@@ -183,6 +189,15 @@ struct Consume {
     /// Limit for consume events instruction
     #[arg(short, long)]
     limit: u16,
+
+    /// Open orders accounts to crank (comma separated or repeated flag). Defaults to your --oos key
+    #[arg(
+        long = "open-orders",
+        value_name = "PUBKEY",
+        value_delimiter = ',',
+        num_args = 1..
+    )]
+    open_orders: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -190,6 +205,15 @@ struct ConsumePermissioned {
     /// Limit for consume events permissioned instruction
     #[arg(short, long)]
     limit: u16,
+
+    /// Open orders accounts to crank (comma separated or repeated flag). Defaults to your --oos key
+    #[arg(
+        long = "open-orders",
+        value_name = "PUBKEY",
+        value_delimiter = ',',
+        num_args = 1..
+    )]
+    open_orders: Vec<String>,
 }
 
 #[tokio::main]
@@ -226,6 +250,15 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Info => {
             info!("[*] OB_V1_Client:\n{:#?}", ob_client);
+        }
+
+        Commands::EventQueue => {
+            let stats = ob_client.fetch_event_queue_stats().await?;
+            let needs_crank = stats.count > 0;
+            info!(
+                "[*] Event queue stats => pending_events: {}, head: {}, seq_num: {}, account_flags: 0x{:x}, needs_crank: {}",
+                stats.count, stats.head, stats.seq_num, stats.account_flags, needs_crank
+            );
         }
 
         Commands::Place(arg) => {
@@ -315,16 +348,38 @@ async fn main() -> Result<()> {
         }
 
         Commands::Consume(arg) => {
+            let open_orders = if arg.open_orders.is_empty() {
+                let mut owners = ob_client
+                    .collect_event_queue_open_orders(arg.limit as usize)
+                    .await?;
+                if owners.is_empty() {
+                    owners.push(ob_client.open_orders.oo_key);
+                }
+                owners
+            } else {
+                parse_open_orders(&arg.open_orders)?
+            };
             let (_confirmed, signature) = ob_client
-                .consume_events_instruction(Vec::new(), arg.limit)
+                .consume_events_instruction(open_orders, arg.limit)
                 .await?;
             info!("\n[*] Transaction successful, signature: {:?}", signature);
             show_tx(&mut ob_client, &signature).await?;
         }
 
         Commands::ConsumePermissioned(arg) => {
+            let open_orders = if arg.open_orders.is_empty() {
+                let mut owners = ob_client
+                    .collect_event_queue_open_orders(arg.limit as usize)
+                    .await?;
+                if owners.is_empty() {
+                    owners.push(ob_client.open_orders.oo_key);
+                }
+                owners
+            } else {
+                parse_open_orders(&arg.open_orders)?
+            };
             let (_confirmed, signature) = ob_client
-                .consume_events_permissioned_instruction(Vec::new(), arg.limit)
+                .consume_events_permissioned_instruction(open_orders, arg.limit)
                 .await?;
             info!("\n[*] Transaction successful, signature: {:?}", signature);
             show_tx(&mut ob_client, &signature).await?;
@@ -434,5 +489,15 @@ async fn execute_limited_cancel(
     }
 
     Ok(last_sig)
+}
+
+fn parse_open_orders(inputs: &[String]) -> Result<Vec<Pubkey>> {
+    let mut keys = Vec::new();
+    for key in inputs {
+        let parsed = Pubkey::from_str(key)
+            .map_err(|e| anyhow!("Invalid open orders pubkey '{key}': {e}"))?;
+        keys.push(parsed);
+    }
+    Ok(keys)
 }
 
