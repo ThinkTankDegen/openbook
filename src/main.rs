@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 // Re-exports from the openbook crate
 use openbook::commitment_config::CommitmentConfig;
 use openbook::matching::Side;
-use openbook::v1::ob_client::OBClient;
+use openbook::v1::ob_client::{OBClient, PROGRAM_ID_ENV, SRM_PROGRAM_ID};
 use openbook::v1::orders::OrderReturnType;
 
 use openbook::signature::Signature;
@@ -39,6 +39,14 @@ struct Cli {
         )
     )]
     market_id: String,
+
+    /// Program id of the DEX (OpenBook v1 by default, Serum v3 supported)
+    #[arg(
+        long,
+        default_value = SRM_PROGRAM_ID,
+        help = "DEX program id to target (e.g. 9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin for Serum v3)"
+    )]
+    program_id: String,
 
     #[command(subcommand)]
     command: Commands,
@@ -201,6 +209,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Configure the target program id before instantiating the client
+    std::env::set_var(PROGRAM_ID_ENV, &cli.program_id);
 
     // Instantiate OB v1 client
     let market_id = cli.market_id.parse()?;

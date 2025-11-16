@@ -2474,34 +2474,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
-name = "openbook"
-version = "0.1.0"
-source = "git+https://github.com/GigaDAO/openbook.git#63a5e1633af3152af21784aa82d65cfb56dbec00"
-dependencies = [
- "anyhow",
- "backon",
- "borsh 0.10.4",
- "openbook_dex",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "solana-client",
- "solana-rpc-client-api",
- "solana-sdk",
- "solana-transaction-status",
- "spl-associated-token-account",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "openbook-v1-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "backon",
+ "borsh 0.10.4",
  "clap 4.5.51",
- "openbook",
+ "openbook_dex",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "solana-cli-output",
@@ -2509,6 +2490,7 @@ dependencies = [
  "solana-rpc-client-api",
  "solana-sdk",
  "solana-transaction-status",
+ "spl-associated-token-account",
  "tokio",
  "tracing",
  "tracing-subscriber",

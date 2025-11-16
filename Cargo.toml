@@ -3,6 +3,9 @@ name = "openbook-v1-cli"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "openbook"
+
 [dependencies]
 anyhow = "1.0"
 
@@ -10,9 +13,6 @@ tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "time"] }
 clap = { version = "4.5", features = ["derive"] }
 
 solana-cli-output = "=1.17.34"
-
-# Use GigaDAO/openbook as a *library*, only with v1 feature.
-openbook = { git = "https://github.com/GigaDAO/openbook.git", default-features = false, features = ["v1"] }
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
@@ -23,9 +23,13 @@ solana-transaction-status = "=1.17.34"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 backon = "0.4"
+openbook_dex = "0.5.6"
+rand = "0.8"
+spl-associated-token-account = "2.3.0"
+borsh = "0.10"
 
 [features]
-default = []
+default = ["v1"]
 cli = []
 v1 = []
 v2 = []

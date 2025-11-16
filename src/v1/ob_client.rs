@@ -40,6 +40,8 @@ use tracing::debug;
 
 pub static SPL_TOKEN_ID: &'static str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub static SRM_PROGRAM_ID: &'static str = "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX";
+pub static SERUM_V3_PROGRAM_ID: &'static str = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+pub static PROGRAM_ID_ENV: &'static str = "PROGRAM_ID";
 
 // Limit how many cancel instructions we build so we do not exceed Solana's 1232-byte raw transaction size cap.
 const MAX_CANCEL_ORDERS: usize = 5;
@@ -137,6 +139,9 @@ impl OBClient {
         let rpc_url =
             std::env::var("RPC_URL").unwrap_or("https://api.mainnet-beta.solana.com".to_string());
         let key_path = std::env::var("KEY_PATH").unwrap_or("".to_string());
+        let program_id_str =
+            std::env::var(PROGRAM_ID_ENV).unwrap_or_else(|_| SRM_PROGRAM_ID.to_string());
+        let program_id = Pubkey::from_str(&program_id_str)?;
 
         let owner = read_keypair(&key_path);
         let rpc_client = RpcClient::new_with_commitment(rpc_url, commitment);
@@ -152,7 +157,6 @@ impl OBClient {
         let mut account_2 = rpc_client.inner().get_account(&market_id).await?;
         let account_info_1;
         let account_info_2;
-        let program_id = SRM_PROGRAM_ID.parse().unwrap();
         {
             account_info_1 = create_account_info_from_account(
                 &mut account_1,
@@ -169,9 +173,8 @@ impl OBClient {
                 false,
             );
         }
-        let market = MarketState::load(&account_info_1, &SRM_PROGRAM_ID.parse().unwrap(), false)?;
-        let market_auth =
-            MarketAuth::load(&account_info_2, &SRM_PROGRAM_ID.parse().unwrap(), false)?;
+        let market = MarketState::load(&account_info_1, &program_id, false)?;
+        let market_auth = MarketAuth::load(&account_info_2, &program_id, false)?;
         let default_auth = Default::default();
         let events_authority = market_auth
             .consume_events_authority()
@@ -182,7 +185,7 @@ impl OBClient {
 
         let market_info = Market::new(
             rpc_client.clone(),
-            SRM_PROGRAM_ID.parse().unwrap(),
+            program_id,
             market_id,
             base_mint,
             quote_mint,
@@ -198,7 +201,7 @@ impl OBClient {
         let cloned_owner = owner.insecure_clone();
         let open_orders = OpenOrders::new(
             rpc_client.clone(),
-            SRM_PROGRAM_ID.parse().unwrap(),
+            program_id,
             cloned_owner,
             market_info.market_address,
         )

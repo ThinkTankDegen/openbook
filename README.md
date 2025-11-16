@@ -12,11 +12,14 @@ export KEY_PATH=/PATH/TO/YOUR/keypair.json
 ```
 export OOS_KEY=TheOPENordersACCOUNTofYOURwalletFORtheMARKETyouWANTtoACTon
 ```
+3.  (Optional) Override the DEX program id via the `PROGRAM_ID` env var or the `--program-id` flag when running the CLI.
+    Use `PROGRAM_ID=9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin` to talk to Serum v3; the default remains OpenBook v1 (`srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX`).
 
 ## Run the command to get the market info
 ```
 ./target/release/openbook-v1-cli \                         
   --market-id TheMARKETid \
+  --program-id 9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin \
   info
 ```
 If you do have open orders on that market for that wallet and that open orders account you should see a non-empty `open_asks` or `open_bids` in your output. E.g.:
