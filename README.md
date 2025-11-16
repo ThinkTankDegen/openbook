@@ -12,11 +12,14 @@ export KEY_PATH=/PATH/TO/YOUR/keypair.json
 ```
 export OOS_KEY=TheOPENordersACCOUNTofYOURwalletFORtheMARKETyouWANTtoACTon
 ```
+3.  (Optional) Override the DEX program id via the `PROGRAM_ID` env var or the `--program-id` flag when running the CLI.
+    Use `PROGRAM_ID=9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin` to talk to Serum v3; the default remains OpenBook v1 (`srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX`).
 
 ## Run the command to get the market info
 ```
 ./target/release/openbook-v1-cli \                         
   --market-id TheMARKETid \
+  --program-id 9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin \
   info
 ```
 If you do have open orders on that market for that wallet and that open orders account you should see a non-empty `open_asks` or `open_bids` in your output. E.g.:
@@ -45,6 +48,24 @@ Run this command to simulate the cancel of up to `MAX_CANCEL_ORDERS` at once. Th
   --market-id TheMARKETid \
   cancel
 ```
+
+## Inspect the event queue
+Run this command to see how many pending events are still waiting to be cranked/consumed.
+```
+./target/release/openbook-v1-cli \
+  --market-id TheMARKETid \
+  event-queue
+```
+If `pending_events` is greater than zero the market still has work for a crank to process.
+
+## Consume events / crank
+Run this command to process pending events. If you do not pass `--open-orders`, the CLI will scan the event queue and include the accounts currently referenced; otherwise you can provide a comma-separated list.
+```
+./target/release/openbook-v1-cli \
+  --market-id TheMARKETid \
+  consume --limit 5 --open-orders ooPubkey1,ooPubkey2
+```
+For permissioned markets, swap `consume` with `consume-permissioned`.
 
 ## Cancel open orders (Actual execution mode)
 Run this command to cancel up to `MAX_CANCEL_ORDERS` at once. This is already set to 5 in the code in order to avoid exceeding the block limit. Feel free to change it. If you have more open orders you can re-run the command.

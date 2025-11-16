@@ -9,12 +9,15 @@ use crate::{
     v1::traits::{MarketInfo, OpenOrdersT},
 };
 
-use anyhow::{Error, Result};
+use anyhow::{anyhow, Error, Result};
 use openbook_dex::{
     critbit::Slab,
     instruction::SelfTradeBehavior,
     matching::{OrderType, Side},
-    state::{Market as MarketAuth, MarketState},
+    state::{
+        EventQueueHeader, Market as MarketAuth, MarketState, ACCOUNT_HEAD_PADDING,
+        ACCOUNT_TAIL_PADDING,
+    },
 };
 use rand::random;
 use solana_sdk::{
@@ -28,7 +31,8 @@ use solana_sdk::{
 use spl_associated_token_account::get_associated_token_address;
 use std::{
     cell::RefMut,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    convert::TryInto,
     fmt::{Debug, Formatter},
     num::NonZeroU64,
     str::FromStr,
@@ -40,6 +44,8 @@ use tracing::debug;
 
 pub static SPL_TOKEN_ID: &'static str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub static SRM_PROGRAM_ID: &'static str = "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX";
+pub static SERUM_V3_PROGRAM_ID: &'static str = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+pub static PROGRAM_ID_ENV: &'static str = "PROGRAM_ID";
 
 // Limit how many cancel instructions we build so we do not exceed Solana's 1232-byte raw transaction size cap.
 const MAX_CANCEL_ORDERS: usize = 5;
@@ -61,6 +67,19 @@ pub struct OBClient {
     pub market_info: Market,
     /// A HashMap containing open orders cache entries associated with their public keys.
     pub open_orders_cache: HashMap<Pubkey, OpenOrdersCacheEntry>,
+}
+
+/// Summary of the market's event queue state.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EventQueueStats {
+    /// Raw account flag bits stored on the queue.
+    pub account_flags: u64,
+    /// Current head pointer inside the ring buffer.
+    pub head: u64,
+    /// Number of pending events waiting to be consumed.
+    pub count: u64,
+    /// Monotonic event id.
+    pub seq_num: u64,
 }
 
 impl Debug for OBClient {
@@ -137,6 +156,9 @@ impl OBClient {
         let rpc_url =
             std::env::var("RPC_URL").unwrap_or("https://api.mainnet-beta.solana.com".to_string());
         let key_path = std::env::var("KEY_PATH").unwrap_or("".to_string());
+        let program_id_str =
+            std::env::var(PROGRAM_ID_ENV).unwrap_or_else(|_| SRM_PROGRAM_ID.to_string());
+        let program_id = Pubkey::from_str(&program_id_str)?;
 
         let owner = read_keypair(&key_path);
         let rpc_client = RpcClient::new_with_commitment(rpc_url, commitment);
@@ -152,7 +174,6 @@ impl OBClient {
         let mut account_2 = rpc_client.inner().get_account(&market_id).await?;
         let account_info_1;
         let account_info_2;
-        let program_id = SRM_PROGRAM_ID.parse().unwrap();
         {
             account_info_1 = create_account_info_from_account(
                 &mut account_1,
@@ -169,9 +190,8 @@ impl OBClient {
                 false,
             );
         }
-        let market = MarketState::load(&account_info_1, &SRM_PROGRAM_ID.parse().unwrap(), false)?;
-        let market_auth =
-            MarketAuth::load(&account_info_2, &SRM_PROGRAM_ID.parse().unwrap(), false)?;
+        let market = MarketState::load(&account_info_1, &program_id, false)?;
+        let market_auth = MarketAuth::load(&account_info_2, &program_id, false)?;
         let default_auth = Default::default();
         let events_authority = market_auth
             .consume_events_authority()
@@ -182,7 +202,7 @@ impl OBClient {
 
         let market_info = Market::new(
             rpc_client.clone(),
-            SRM_PROGRAM_ID.parse().unwrap(),
+            program_id,
             market_id,
             base_mint,
             quote_mint,
@@ -198,7 +218,7 @@ impl OBClient {
         let cloned_owner = owner.insecure_clone();
         let open_orders = OpenOrders::new(
             rpc_client.clone(),
-            SRM_PROGRAM_ID.parse().unwrap(),
+            program_id,
             cloned_owner,
             market_info.market_address,
         )
@@ -315,6 +335,113 @@ impl OBClient {
         };
 
         Ok((bids_address, asks_address, self.open_orders.clone()))
+    }
+
+    /// Fetches the raw event queue header so callers can see if cranking is needed.
+    pub async fn fetch_event_queue_stats(&self) -> Result<EventQueueStats> {
+        let account = self
+            .rpc_client
+            .inner()
+            .get_account(&self.market_info.event_queue)
+            .await?;
+
+        let header_len = std::mem::size_of::<EventQueueHeader>();
+        let head_pad = ACCOUNT_HEAD_PADDING.len();
+        let tail_pad = ACCOUNT_TAIL_PADDING.len();
+        if account.data.len() < head_pad + header_len + tail_pad {
+            return Err(anyhow!(
+                "Event queue account too small ({} bytes)",
+                account.data.len()
+            ));
+        }
+        let usable = &account.data[head_pad..account.data.len() - tail_pad];
+        let header_bytes = &usable[..header_len];
+
+        let stats = EventQueueStats {
+            account_flags: Self::read_u64_field(header_bytes, 0)?,
+            head: Self::read_u64_field(header_bytes, 8)?,
+            count: Self::read_u64_field(header_bytes, 16)?,
+            seq_num: Self::read_u64_field(header_bytes, 24)?,
+        };
+
+        Ok(stats)
+    }
+
+    /// Collects unique open orders accounts referenced in the pending event queue.
+    pub async fn collect_event_queue_open_orders(
+        &self,
+        max_accounts: usize,
+    ) -> Result<Vec<Pubkey>> {
+        let event_queue_account = self
+            .rpc_client
+            .inner()
+            .get_account(&self.market_info.event_queue)
+            .await?;
+        let head_pad = ACCOUNT_HEAD_PADDING.len();
+        let tail_pad = ACCOUNT_TAIL_PADDING.len();
+        if event_queue_account.data.len() < head_pad + tail_pad {
+            return Ok(Vec::new());
+        }
+        let usable =
+            &event_queue_account.data[head_pad..event_queue_account.data.len() - tail_pad];
+        let header_len = std::mem::size_of::<EventQueueHeader>();
+        if usable.len() < header_len {
+            return Ok(Vec::new());
+        }
+        let head = Self::read_u64_field(usable, 8)? as usize;
+        let count = Self::read_u64_field(usable, 16)? as usize;
+        let events_bytes = &usable[header_len..];
+        let event_size = std::mem::size_of::<openbook_dex::state::Event>();
+        if event_size == 0 {
+            return Ok(Vec::new());
+        }
+        let capacity = events_bytes.len() / event_size;
+        if capacity == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut seen = HashSet::new();
+        let mut owners = Vec::new();
+        let max_events = count.min(capacity);
+        for offset in 0..max_events {
+            let idx = (head + offset) % capacity;
+            let start = idx * event_size;
+            let end = start + event_size;
+            if end > events_bytes.len() {
+                break;
+            }
+            let event = Self::event_from_bytes(&events_bytes[start..end])?;
+            let owner = Pubkey::from(u64_slice_to_pubkey(event.owner));
+            if seen.insert(owner) {
+                owners.push(owner);
+                if max_accounts > 0 && owners.len() >= max_accounts {
+                    break;
+                }
+            }
+        }
+
+        Ok(owners)
+    }
+
+    fn read_u64_field(bytes: &[u8], offset: usize) -> Result<u64> {
+        let end = offset + 8;
+        let chunk = bytes
+            .get(offset..end)
+            .ok_or_else(|| anyhow!("Missing bytes in event queue header"))?;
+        let arr: [u8; 8] = chunk
+            .try_into()
+            .map_err(|_| anyhow!("Failed to parse event queue header"))?;
+        Ok(u64::from_le_bytes(arr))
+    }
+
+    fn event_from_bytes(bytes: &[u8]) -> Result<openbook_dex::state::Event> {
+        if bytes.len() < std::mem::size_of::<openbook_dex::state::Event>() {
+            return Err(anyhow!("Incomplete event record"));
+        }
+        // SAFETY: Event is #[repr(packed)] and Copy, so read_unaligned is safe.
+        let event =
+            unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const openbook_dex::state::Event) };
+        Ok(event)
     }
 
     /// Processes bids information to find the maximum bid price.
