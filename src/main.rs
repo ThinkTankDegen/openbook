@@ -23,7 +23,7 @@ const MAX_CANCEL_ORDERS_PER_TX: usize = 5;
 /// Simple v1-only CLI for OpenBook.
 #[derive(Parser, Debug)]
 #[command(
-    author = "You",
+    author = "ThinkTank - Based off of GigaDAO - With AI help",
     version,
     about = "OpenBook v1 CLI (no v2, no TUI)",
     long_about = None
